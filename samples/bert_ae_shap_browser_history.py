@@ -36,9 +36,105 @@ HIDDEN = 256
 EMBED_POOL = "mean"  # 'cls' or 'mean'
 THRESHOLD_Q = 0.98  # 上位2%を異常とみなす(適宜調整)
 SEED = 42
+# 自動判定の上書きが必要な時は "ja" / "en" など文字列を入れる。None なら自動判定
+PREFERRED_LOCALE = None
+# 自動判定できなかった時のフォールバック
+DEFAULT_LOCALE = "en"
+# タイトル何件くらい見て判定するか（大きいほど精度↑、重さ↑）
+LOCALE_SAMPLE_N = 200
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+# --- 言語推定（スクリプト検出 + URLパラメータ + TLD） ---
+_JA_HIRA = r"\u3040-\u309F"   # ひらがな
+_JA_KATA = r"\u30A0-\u30FF"   # カタカナ
+_HAN = r"\u4E00-\u9FFF"       # CJK 漢字
+_KO_HANGUL = r"\uAC00-\uD7AF"
+
+def _score_text_lang(s: str) -> dict:
+    """与えられたテキストに含まれる各言語らしさを粗くスコア化"""
+    import re
+    s = s or ""
+    scores = {"ja": 0, "ko": 0, "zh": 0, "en": 0}
+    # 日本語：ひらがな・カタカナが強い証拠
+    if re.search(f"[{_JA_HIRA}]", s): scores["ja"] += 3
+    if re.search(f"[{_JA_KATA}]", s): scores["ja"] += 2
+    # CJK漢字のみ→中国語/日本語のどちらか。ひら/カタが無ければ zh に+1
+    if re.search(f"[{_HAN}]", s):
+        if scores["ja"] == 0: scores["zh"] += 1
+        else: scores["ja"] += 1
+    # ハングル
+    if re.search(f"[{_KO_HANGUL}]", s): scores["ko"] += 3
+    # ラテン文字（英語らしさ）
+    if re.search(r"[A-Za-z]", s): scores["en"] += 1
+    return scores
+
+_TLD_TO_LANG = {
+    ".co.jp": "ja", ".jp": "ja",
+    ".kr": "ko", ".cn": "zh", ".tw": "zh",
+}
+
+def _lang_from_url_params(url: str) -> str:
+    """hl, lr, lang, locale などのURLクエリから推定（Google等）"""
+    try:
+        u = urlparse(url); q = parse_qs(u.query or "")
+        for key in ("hl", "lr", "lang", "locale"):
+            if key in q and len(q[key]) > 0:
+                v = (q[key][0] or "").lower()
+                # 例: hl=ja, lr=lang_ja, lang=en-US
+                if "ja" in v: return "ja"
+                if "en" in v: return "en"
+                if "ko" in v: return "ko"
+                if "zh" in v or "cn" in v: return "zh"
+    except Exception:
+        pass
+    return ""
+
+def _lang_from_tld(url: str) -> str:
+    """TLDでざっくり。google.co.jp など"""
+    try:
+        host = (urlparse(url).netloc or "").lower()
+        for suf, lang in _TLD_TO_LANG.items():
+            if host.endswith(suf): return lang
+    except Exception:
+        pass
+    return ""
+
+def decide_output_locale(df: pd.DataFrame) -> str:
+    """
+    DataFrame（title/url等）から 全体の出力ロケールを推定。
+    優先度: PREFERRED_LOCALE(手動) > URLの言語パラメータ > タイトルのスクリプト > TLD > DEFAULT_LOCALE
+    """
+    if PREFERRED_LOCALE:
+        return PREFERRED_LOCALE
+
+    # 1) URLパラメータから強い証拠を探す
+    lang_votes = {"ja": 0, "en": 0, "ko": 0, "zh": 0}
+    urls = df["url"].astype(str).tolist()[:LOCALE_SAMPLE_N]
+    for u in urls:
+        v = _lang_from_url_params(u)
+        if v: lang_votes[v] += 2  # URLパラメータは強く重み付け
+
+    # 2) タイトルのスクリプト検出（多数決）
+    titles = df["title"].astype(str).tolist()[:LOCALE_SAMPLE_N]
+    for t in titles:
+        s = _score_text_lang(t)
+        for k, v in s.items():
+            lang_votes[k] += v
+
+    # 3) パラメータ・スクリプトで決まらなければ TLD から補助
+    if max(lang_votes.values()) == 0:
+        for u in urls:
+            v = _lang_from_tld(u)
+            if v: lang_votes[v] += 1
+
+    # 4) 票が最大の言語。全て0ならDEFAULT_LOCALE
+    lang = max(lang_votes, key=lambda k: lang_votes[k]) if any(lang_votes.values()) else DEFAULT_LOCALE
+
+    # 5) 未対応言語は英語にフォールバック（今はja/en対応、他は順次拡張）
+    return lang if lang in {"ja", "en"} else DEFAULT_LOCALE
+
 
 # ============== データ前処理 ==============
 def _chrome_time_to_iso(time_usec: Optional[object]) -> str:
@@ -806,10 +902,17 @@ def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
     return results
 
 # ====== ここで“呼び出す” ======
+# 推定ロケールを決める
+output_locale = decide_output_locale(df)
+
 language_results = build_language_results(
-    df=df, shap_values=shap_values, sample_idx=sample_idx,
-    threshold=thr, locale="ja"
+    df=df,
+    shap_values=shap_values,
+    sample_idx=sample_idx,
+    threshold=thr,
+    locale=output_locale   # ← ここを自動判定に
 )
+
 print(json.dumps(language_results, ensure_ascii=False, indent=2))
 with open("anomaly_language_results.json", "w", encoding="utf-8") as f:
     json.dump(language_results, f, ensure_ascii=False, indent=2)
