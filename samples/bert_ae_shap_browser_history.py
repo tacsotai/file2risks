@@ -1,12 +1,14 @@
 # file: bert_ae_shap_browser_history.py
-import os
-import math
-import random
+import os, json
+from typing import Optional
+from urllib.parse import urlparse, parse_qs, unquote_plus
+import pandas as pd
 import numpy as np
+import random
 import pandas as pd
 import tldextract
 from tqdm import tqdm
-from datetime import datetime
+from typing import List, Optional
 import json
 import re
 
@@ -175,14 +177,143 @@ def extract_domain(url: str) -> str:
         return domain or url
     except Exception:
         return url
+    
+def _pick_first(params: dict, keys: list):
+    for k in keys:
+        if k in params and len(params[k]) > 0:
+            v = params[k][0]
+            if isinstance(v, str) and v.strip():
+                return v
+    return None
+
+def _clean_query(q: str) -> str:
+    # + や %xx を人間可読に、余計な空白を整理
+    q = unquote_plus(q)
+    q = " ".join(q.split())
+    return q[:200]  # 長すぎるのはカット（任意）
+
+def parse_search_query(url: str, title: str):
+    """
+    主要サイトの検索クエリを抽出する。
+    戻り値: {"engine": str | None, "query": str | None, "kind": str | None}
+      engine: "google" 等
+      kind:   "web" | "images" | "video" | など（分かる範囲で）
+    """
+    try:
+        u = urlparse(url)
+        host = (u.netloc or "").lower()
+        path = (u.path or "").lower()
+        params = parse_qs(u.query or "")
+
+        # Google
+        if "google." in host:
+            q = _pick_first(params, ["q"])
+            tbm = _pick_first(params, ["tbm"])  # isch=画像, nws=ニュース など
+            # タイトル補完: 「 ... - Google 検索」
+            if not q and title:
+                # 日本語UIの例: "キーワード - Google 検索"
+                if " - google 検索" in title.lower():
+                    q = title[: title.lower().rfind(" - google 検索")]
+                elif " - google search" in title.lower():
+                    q = title[: title.lower().rfind(" - google search")]
+            kind = "images" if tbm == "isch" else ("news" if tbm == "nws" else "web")
+            return {"engine": "google", "query": _clean_query(q) if q else None, "kind": kind}
+
+        # YouTube
+        if "youtube.com" in host or "youtu.be" in host:
+            if "/results" in path:
+                q = _pick_first(params, ["search_query", "query"])
+                return {"engine": "youtube", "query": _clean_query(q) if q else None, "kind": "video"}
+            # /watch にはクエリが無い場合が多いのでスキップ
+            return {"engine": "youtube", "query": None, "kind": "video"}
+
+        # Bing
+        if "bing.com" in host and "/search" in path:
+            q = _pick_first(params, ["q"])
+            return {"engine": "bing", "query": _clean_query(q) if q else None, "kind": "web"}
+
+        # Yahoo
+        if ("search.yahoo" in host or "yahoo.co.jp" in host) and "/search" in path:
+            q = _pick_first(params, ["p", "q"])
+            return {"engine": "yahoo", "query": _clean_query(q) if q else None, "kind": "web"}
+
+        # DuckDuckGo
+        if "duckduckgo.com" in host:
+            q = _pick_first(params, ["q"])
+            return {"engine": "duckduckgo", "query": _clean_query(q) if q else None, "kind": "web"}
+
+        # Baidu
+        if "baidu.com" in host:
+            q = _pick_first(params, ["wd", "word"])
+            return {"engine": "baidu", "query": _clean_query(q) if q else None, "kind": "web"}
+
+        # Naver
+        if "naver.com" in host and "/search" in path:
+            q = _pick_first(params, ["query"])
+            return {"engine": "naver", "query": _clean_query(q) if q else None, "kind": "web"}
+
+        # X (Twitter)
+        if ("twitter.com" in host or "x.com" in host) and "/search" in path:
+            q = _pick_first(params, ["q"])
+            return {"engine": "x", "query": _clean_query(q) if q else None, "kind": "social"}
+
+        # Reddit
+        if "reddit.com" in host and "/search" in path:
+            q = _pick_first(params, ["q"])
+            return {"engine": "reddit", "query": _clean_query(q) if q else None, "kind": "forum"}
+
+        # Amazon 検索
+        if "amazon." in host and (path.startswith("/s") or "/s?" in url):
+            q = _pick_first(params, ["k"])
+            return {"engine": "amazon", "query": _clean_query(q) if q else None, "kind": "shopping"}
+
+        return {"engine": None, "query": None, "kind": None}
+    except Exception:
+        return {"engine": None, "query": None, "kind": None}
+
 
 def compose_text(row) -> str:
     title = row.get("title","")
     url = row.get("url","")
     domain = extract_domain(url)
-    # ここで危険キーワードや時間帯特徴を含めてもよい
     ts = row.get(TIMESTAMP_COL, "")
-    return f"[TITLE] {title} [DOMAIN] {domain} [URL] {url} [TIME] {ts}"
+
+    # --- 先頭に追加：検索クエリがあれば最優先で自然文を作る ---
+    sq = parse_search_query(row_url if 'row_url' in locals() else "", title)
+    # ↑ row_url を渡したいので、後述の build_language_results 変更で渡します
+
+    if sq.get("query"):
+        engine = sq.get("engine") or "web"
+        q = sq["query"]
+        name = _friendly_domain(domain) if '_friendly_domain' in globals() else domain
+        if locale == "ja":
+            # 種別ごとに言い分け（任意）
+            if engine == "google":
+                return f"Google で「{q}」を検索しました。必要な情報収集の一環です。"
+            if engine == "youtube":
+                return f"YouTube で「{q}」の動画を探しました。学習や情報収集の可能性があります。"
+            if engine == "x":
+                return f"X（Twitter）で「{q}」を検索しました。話題や動向の確認かもしれません。"
+            if engine == "amazon":
+                return f"Amazon で「{q}」を検索しました。購買検討の段階かもしれません。"
+            return f"{engine.capitalize()} で「{q}」を検索しました。"
+        else:
+            if engine == "google":
+                return f"Searched Google for “{q}”. Likely part of information gathering."
+            if engine == "youtube":
+                return f"Searched YouTube for “{q}”. Possibly tutorials or info."
+            if engine == "x":
+                return f"Searched X (Twitter) for “{q}”. Checking topics and trends."
+            if engine == "amazon":
+                return f"Searched Amazon for “{q}”. Possibly in consideration phase."
+            return f"Searched {engine.capitalize()} for “{q}”."
+
+    if sq.get("query"):
+        # 検索クエリを含める（BERT への入力を豊かに）
+        return f"[SEARCH] {sq['engine']}:{sq['query']} [TITLE] {title} [DOMAIN] {domain} [URL] {url} [TIME] {ts}"
+    else:
+        return f"[TITLE] {title} [DOMAIN] {domain} [URL] {url} [TIME] {ts}"
+
 
 df = load_history(CSV_PATH)
 texts = df.apply(compose_text, axis=1).tolist()
@@ -327,14 +458,12 @@ masker = shap.maskers.Text(tokenizer)  # トークン単位でマスク
 explainer = shap.Explainer(anomaly_fn, masker)
 shap_values = explainer(explain_texts)  # 各トークンが異常スコアに与える寄与
 
-# 可視化（HTMLを保存）
 html_path = "shap_anomaly_texts.html"
 with open(html_path, "w", encoding="utf-8") as f:
     for sv in shap_values:
         f.write(shap.plots.text(sv, display=False))
 print(f"Saved SHAP HTML to: {html_path}")
 
-# ついでにスコア分布の簡易プロット
 plt.figure()
 plt.hist(errors, bins=30)
 plt.axvline(thr, linestyle="--")
@@ -344,123 +473,343 @@ plt.tight_layout()
 plt.savefig("anomaly_score_hist.png")
 print("Saved plot: anomaly_score_hist.png")
 
+# ===== トークン抽出・日付整形 =====
 def _extract_top_tokens(sv, k=3):
-    """
-    SHAPのテキストExplanationから、正の寄与が大きい上位トークンを返す。
-    返り値: list[str]
-    """
-    import numpy as np
-    import re
-
-    # sv.data, sv.values は list/np.ndarray/ネスト配列のいずれか
-    tokens = sv.data
-    values = sv.values
-
-    # 何でも 1 次元の list に落とすユーティリティ
+    import numpy as np, re
+    tokens = sv.data; values = sv.values
     def _to_1d_list(x):
         if isinstance(x, list):
-            # ネストしていれば 1 要素目を拾う（Text masker は [[...]] のことがある）
-            return x[0] if len(x) == 1 and isinstance(x[0], (list, np.ndarray)) else x
+            return x[0] if (len(x)==1 and isinstance(x[0], (list, np.ndarray))) else x
         x = np.array(x, dtype=object)
-        if x.ndim == 0:
-            return [x.item()]
-        if x.ndim == 2 and x.shape[0] == 1:
-            x = x[0]
+        if x.ndim == 0: return [x.item()]
+        if x.ndim == 2 and x.shape[0] == 1: x = x[0]
         return list(x)
-
-    tokens = _to_1d_list(tokens)
-    values = _to_1d_list(values)
-
-    # 長さを合わせる（保険）
-    n = min(len(tokens), len(values))
-    tokens = tokens[:n]
-    values = values[:n]
-
+    tokens = _to_1d_list(tokens); values = _to_1d_list(values)
+    n = min(len(tokens), len(values)); tokens = tokens[:n]; values = values[:n]
     pairs = []
     for t, v in zip(tokens, values):
-        if t is None:
-            continue
-        tok = str(t).strip()
-        if not tok:
-            continue
-        # WordPieceの"##"を除去・特殊トークン除外
-        tok = re.sub(r"^##", "", tok)
-        if tok in {"[CLS]", "[SEP]", "[PAD]"}:
-            continue
+        if t is None: continue
+        tok = re.sub(r"^##", "", str(t).strip())
+        if not tok or tok in {"[CLS]","[SEP]","[PAD]"}: continue
         pairs.append((tok, float(v)))
-
-    # 正の寄与のみ・寄与大きい順
     pos = [(t, v) for t, v in pairs if v > 0]
     pos.sort(key=lambda x: x[1], reverse=True)
-
-    # トークンの重複を軽く除去（上から）
-    seen = set()
-    top = []
+    seen, top = set(), []
     for t, _ in pos:
         if t not in seen:
-            top.append(t)
-            seen.add(t)
-        if len(top) >= k:
-            break
+            top.append(t); seen.add(t)
+        if len(top) >= k: break
     return top
 
 def _to_date_str(x):
     try:
         ts = pd.to_datetime(x, errors="coerce", utc=True)
-        if pd.isna(ts):
-            return None
+        if pd.isna(ts): return None
         return ts.strftime("%Y-%m-%d")
     except Exception:
         return None
 
+# ドメインを人間向けに
+SITE_ALIASES = {
+    "pydata.org": "PyData",
+    "pandas.pydata.org": "Pandas Docs",
+    "numpy.org": "NumPy",
+    "scikit-learn.org": "scikit-learn",
+    "readthedocs.io": "Read the Docs",
+    "huggingface.co": "Hugging Face",
+    "transformers.huggingface.co": "Transformers Docs",
+    "kaggle.com": "Kaggle",
+    "github.com": "GitHub",
+    "gitlab.com": "GitLab",
+    "bitbucket.org": "Bitbucket",
+    "stackoverflow.com": "Stack Overflow",
+    "superuser.com": "Super User",
+    "serverfault.com": "Server Fault",
+    "arxiv.org": "arXiv",
+    "medium.com": "Medium",
+    "towardsdatascience.com": "TDS (Medium)",
+    "youtube.com": "YouTube",
+    "youtu.be": "YouTube",
+    "vimeo.com": "Vimeo",
+    "netflix.com": "Netflix",
+    "primevideo.com": "Prime Video",
+    "bbc.com": "BBC",
+    "cnn.com": "CNN",
+    "nikkei.com": "日本経済新聞",
+    "bloomberg.com": "Bloomberg",
+    "reuters.com": "Reuters",
+    "amazon.co.jp": "Amazon",
+    "rakuten.co.jp": "楽天市場",
+    "shopping.yahoo.co.jp": "Yahoo!ショッピング",
+    "maps.google.com": "Google マップ",
+    "google.com/maps": "Google マップ",
+    "docs.python.org": "Python Docs",
+    "colab.research.google.com": "Google Colab",
+    "console.cloud.google.com": "Google Cloud Console",
+    "portal.azure.com": "Azure Portal",
+    "console.aws.amazon.com": "AWS Console",
+    "classroom.google.com": "Google Classroom",
+    "coursera.org": "Coursera",
+    "edx.org": "edX",
+    "udemy.com": "Udemy",
+    "investing.com": "Investing.com",
+    "tradingview.com": "TradingView",
+    "coinmarketcap.com": "CoinMarketCap",
+    "binance.com": "Binance",
+    "openai.com": "OpenAI",
+}
+
+# 正規表現でカテゴリ推定（順番が重要：上からマッチ優先）
+# (pattern, category, tone)
+CATEGORY_RULES = [
+    (r"(pydata|pandas|numpy|scikit|readthedocs|huggingface|transformers|docs\.python|api\s*reference)", "tech_docs", "positive"),
+    (r"(kaggle|dataset|open\-?data|data\s*portal)", "open_data", "positive"),
+    (r"(news|cnn|bbc|nikkei|bloomberg|reuters|nytimes|wsj)", "news", "neutral"),
+    (r"(github|gitlab|bitbucket|pull\s*request|issue|commit)", "code_hosting", "positive"),
+    (r"(stackoverflow|stack\s*overflow|serverfault|superuser|qiita|teratail)", "qna_forum", "positive"),
+    (r"(youtube|youtu\.be|vimeo|netflix|primevideo|tver|abema)", "video_streaming", "neutral"),
+    (r"(maps|google\.com/maps|map\.)", "maps_travel", "positive"),
+    (r"(classroom|coursera|edx|udemy|khan\s*academy|mooc)", "education_mooc", "positive"),
+    (r"(invest|tradingview|portfolio|securities|brokerage)", "finance_invest", "neutral"),
+    (r"(crypto|bitcoin|ethereum|defi|web3|nft)", "crypto", "neutral"),
+    (r"(casino|gambl|bet|poker|odds)", "gambling", "caution"),
+    (r"(adult|porn|xxx)", "adult", "caution"),
+    (r"(shopping|cart|store|amazon|rakuten|yodobashi|biccamera)", "shopping", "neutral"),
+    (r"(slack|discord|teams|zoom|meet\.google|webex)", "collaboration", "positive"),
+    (r"(calendar|schedule|calendar\.google)", "productivity", "positive"),
+    (r"(gmail|outlook|mail\.google|yahoo\.co\.jp/mail)", "email_webmail", "neutral"),
+    (r"(sports|premier\s*league|mlb|nba|nfl|nhl|j\s*league|soccer)", "sports", "neutral"),
+    (r"(steam|epic\s*games|playstation|nintendo|xbox|gameplay)", "gaming", "neutral"),
+    (r"(gov|go\.jp|met\.go\.jp|city\.|pref\.)", "government", "neutral"),
+    (r"(health|medical|nih|who\.int|cdc\.gov|medic|drug)", "health_medical", "neutral"),
+    (r"(recruit|indeed|linkedin/jobs|careers|green-japan)", "job_career", "positive"),
+    (r"(ai|ml|machine\s*learning|deep\s*learning|LLM|prompt)", "ai_ml", "positive"),
+    (r"(arxiv|doi\.org|ieee|acm|springer|nature\.com)", "academic_papers", "positive"),
+    (r"(docs|document|manual|guide|how\s*to)", "docs", "positive"),
+]
+
+def _friendly_domain(domain: str) -> str:
+    d = domain.lower()
+    return SITE_ALIASES.get(d, domain)
+
+def guess_category(domain: str, title: str, top_tokens: List[str]):
+    text = f"{domain} {title} {' '.join(top_tokens)}".lower()
+    for pat, cat, tone in CATEGORY_RULES:
+        if re.search(pat, text):
+            return cat, tone
+    return "other", "neutral"
+
+def hour_bucket(ts_iso: Optional[str]) -> str:
+    try:
+        dt = pd.to_datetime(ts_iso, errors="coerce", utc=True).tz_convert("Asia/Tokyo")
+        h = dt.hour
+        if 0 <= h < 5: return "late_night"
+        if 5 <= h < 9: return "early_morning"
+        if 9 <= h < 18: return "daytime"
+        return "evening"
+    except Exception:
+        return "unknown"
+
+def clean_tokens(tokens: List[str]) -> List[str]:
+    kept = []
+    for t in tokens:
+        t = re.sub(r"^##", "", str(t))
+        if not re.search(r"[A-Za-z0-9\u3040-\u30FF\u4E00-\u9FFF]", t):
+            continue
+        if t in {"[CLS]","[SEP]","[PAD]"} or re.fullmatch(r"\d{1,4}", t):
+            continue
+        kept.append(t)
+    return kept[:3]
+
+def build_human_friendly_content(
+    domain: str,
+    title: str,
+    top_tokens: List[str],
+    ts_iso: Optional[str],
+    locale: str = "ja",
+    row_url: str = "" 
+) -> str:
+    cat, tone = guess_category(domain, title, top_tokens)
+    tokens = clean_tokens(top_tokens)
+    hb = hour_bucket(ts_iso)
+    name = _friendly_domain(domain)
+
+    if locale == "ja":
+        if cat in {"tech_docs","docs"}:
+            base, add = f"{name}の技術ドキュメントを閲覧しました。", "実装や学習のヒントになりそうです。"
+        elif cat == "open_data":
+            base, add = f"{name}でオープンデータのリソースを見つけました。", "今後のデータ収集や分析がスムーズになりそうです。"
+        elif cat == "news":
+            base, add = f"{name}のニュースをチェックしました。", "最新トレンドの把握に役立ちます。"
+        elif cat == "code_hosting":
+            base, add = f"{name}でリポジトリやイシューを確認しました。", "開発作業の進行・調査の一環です。"
+        elif cat == "qna_forum":
+            base, add = f"{name}で技術的なQ&Aを参照しました。", "問題解決やノウハウ整理に有益です。"
+        elif cat == "video_streaming":
+            base, add = f"{name}で動画コンテンツを視聴しました。", "チュートリアルや情報収集の可能性があります。"
+        elif cat == "maps_travel":
+            base, add = f"{name}で場所や経路を確認しました。", "移動や外出計画の準備かもしれません。"
+        elif cat == "education_mooc":
+            base, add = f"{name}でオンライン学習コンテンツを確認しました。", "スキルアップの意欲が感じられます。"
+        elif cat == "finance_invest":
+            base, add = f"{name}で投資・相場情報を確認しました。", "意思決定には情報の信頼性にご留意ください。"
+        elif cat == "crypto":
+            base, add = f"{name}で暗号資産関連の情報を閲覧しました。", "価格変動が大きいため注意が必要です。"
+        elif cat == "gambling":
+            base, add = f"{name}にアクセスしました。", "ギャンブル関連の可能性があり、コンプライアンス上の注意が必要です。"
+        elif cat == "adult":
+            base, add = f"{name}にアクセスしました。", "成人向けの可能性があり、業務環境では注意が必要です。"
+        elif cat == "shopping":
+            base, add = f"{name}でショッピング関連のページを閲覧しました。", "比較検討のフェーズかもしれません。"
+        elif cat == "collaboration":
+            base, add = f"{name}でコミュニケーションを行いました。", "チーム連携の一環です。"
+        elif cat == "productivity":
+            base, add = f"{name}でスケジュールやタスクを確認しました。", "生産性向上の行動です。"
+        elif cat == "email_webmail":
+            base, add = f"{name}でメールを確認しました。", "やり取りの整理や返信の準備です。"
+        elif cat == "sports":
+            base, add = f"{name}でスポーツ関連情報を閲覧しました。", "試合結果やハイライトの確認かもしれません。"
+        elif cat == "gaming":
+            base, add = f"{name}でゲーム関連のページを閲覧しました。", "レビューや購入検討の可能性があります。"
+        elif cat == "government":
+            base, add = f"{name}の行政サイトを閲覧しました。", "手続きや公的情報の確認です。"
+        elif cat == "health_medical":
+            base, add = f"{name}で医療・健康情報を確認しました。", "情報の正確性をご確認ください。"
+        elif cat == "job_career":
+            base, add = f"{name}で求人・キャリア情報を確認しました。", "将来の選択肢を検討しているのかもしれません。"
+        elif cat == "ai_ml":
+            base, add = f"{name}でAI/機械学習に関する情報を閲覧しました。", "最新動向のキャッチアップに有効です。"
+        elif cat == "academic_papers":
+            base, add = f"{name}で学術論文・研究情報を確認しました。", "根拠に基づいた検討が行えます。"
+        else:
+            base, add = f"{name}で新しいページを閲覧しました。", "普段と少し異なる傾向が見られます。"
+
+        detail = f"（関連語: {', '.join(tokens)}）" if tokens else ""
+        nuance_map = {
+            "late_night": "夜間の探索は集中しやすい一方、誤クリックにもご注意ください。",
+            "early_morning": "朝の学習・情報収集に良い時間帯ですね。",
+            "daytime": "業務時間帯の閲覧として適切か確認しましょう。",
+            "evening": "一日の振り返りや調査に向いた時間帯です。",
+            "unknown": ""
+        }
+        nuance = nuance_map.get(hb, "")
+        return f"{base}{add}{detail} {nuance}".strip()
+
+    # --- English templates ---
+    if cat in {"tech_docs","docs"}:
+        base, add = f"Visited {name} technical documentation.", "Looks helpful for learning and implementation."
+    elif cat == "open_data":
+        base, add = f"Found open data resources on {name}.", "Should streamline future data collection and analysis."
+    elif cat == "news":
+        base, add = f"Checked news on {name}.", "Useful for tracking current trends."
+    elif cat == "code_hosting":
+        base, add = f"Reviewed repositories/issues on {name}.", "Part of ongoing development or investigation."
+    elif cat == "qna_forum":
+        base, add = f"Looked up Q&A on {name}.", "Helpful for troubleshooting and know-how."
+    elif cat == "video_streaming":
+        base, add = f"Watched content on {name}.", "Could be tutorials or information gathering."
+    elif cat == "maps_travel":
+        base, add = f"Checked routes/places on {name}.", "Planning for travel or commute."
+    elif cat == "education_mooc":
+        base, add = f"Explored online learning on {name}.", "Great for upskilling."
+    elif cat == "finance_invest":
+        base, add = f"Viewed market/investment info on {name}.", "Mind the reliability for decisions."
+    elif cat == "crypto":
+        base, add = f"Browsed crypto-related info on {name}.", "Volatility warrants caution."
+    elif cat == "gambling":
+        base, add = f"Accessed {name}.", "Likely gambling-related; consider compliance risks."
+    elif cat == "adult":
+        base, add = f"Accessed {name}.", "Potentially adult content; be cautious in work contexts."
+    elif cat == "shopping":
+        base, add = f"Browsed shopping pages on {name}.", "Possibly in comparison stage."
+    elif cat == "collaboration":
+        base, add = f"Used {name} for communication.", "Part of team collaboration."
+    elif cat == "productivity":
+        base, add = f"Checked schedule/tasks on {name}.", "Supports productivity."
+    elif cat == "email_webmail":
+        base, add = f"Checked email on {name}.", "Organizing or preparing responses."
+    elif cat == "sports":
+        base, add = f"Viewed sports info on {name}.", "Maybe results or highlights."
+    elif cat == "gaming":
+        base, add = f"Viewed gaming pages on {name}.", "Reviews or purchase consideration."
+    elif cat == "government":
+        base, add = f"Visited a government site: {name}.", "Checking procedures or public info."
+    elif cat == "health_medical":
+        base, add = f"Checked health/medical info on {name}.", "Verify accuracy carefully."
+    elif cat == "job_career":
+        base, add = f"Explored jobs/career info on {name}.", "Considering future options."
+    elif cat == "ai_ml":
+        base, add = f"Read AI/ML information on {name}.", "Good for catching up on trends."
+    elif cat == "academic_papers":
+        base, add = f"Reviewed academic papers on {name}.", "Enables evidence-based discussion."
+    else:
+        base, add = f"Visited {name}.", "Slightly unusual pattern compared to usual behavior."
+
+    detail = f" (key terms: {', '.join(tokens)})" if tokens else ""
+    return f"{base} {add}{detail}".strip()
+
+
+
+def guess_category(domain: str, title: str, top_tokens: List[str]):
+    text = f"{domain} {title} {' '.join(top_tokens)}".lower()
+    for pat, cat, tone in CATEGORY_RULES:
+        if re.search(pat, text):
+            return cat, tone
+    return "other", "neutral"
+
+def hour_bucket(ts_iso: Optional[str]) -> str:
+    try:
+        dt = pd.to_datetime(ts_iso, errors="coerce", utc=True).tz_convert("Asia/Tokyo")
+        h = dt.hour
+        if 0 <= h < 5: return "late_night"
+        if 5 <= h < 9: return "early_morning"
+        if 9 <= h < 18: return "daytime"
+        return "evening"
+    except Exception:
+        return "unknown"
+
+def clean_tokens(tokens: List[str]) -> List[str]:
+    kept = []
+    for t in tokens:
+        t = re.sub(r"^##", "", str(t))
+        if not re.search(r"[A-Za-z0-9\u3040-\u30FF\u4E00-\u9FFF]", t):  # 記号のみ除外
+            continue
+        if t in {"[CLS]","[SEP]","[PAD]"} or re.fullmatch(r"\d{1,4}", t):
+            continue
+        kept.append(t)
+    return kept[:3]
+
+
 def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
-    """
-    df: 異常スコア等を持つDataFrame（columns: title,url,visited_at, anomaly_score, is_anomaly）
-    shap_values: explain_textsに対応した shap.Explanation の配列
-    sample_idx: df上の行インデックス -> shap_values の順序に対応
-    threshold: 異常判定に使った閾値 (thr)
-    locale: "ja" | "en"
-    """
     results = []
+
     for pos, i in enumerate(sample_idx):
         row = df.iloc[i]
         top_tokens = _extract_top_tokens(shap_values[pos], k=3)
-        domain = extract_domain(row.get("url", ""))  # 既存関数を再利用
+        domain = extract_domain(row.get("url",""))
         date_str = _to_date_str(row.get(TIMESTAMP_COL)) if TIMESTAMP_COL in df.columns else None
-        score = float(row.get("anomaly_score", 0.0))
-
-        if locale == "ja":
-            title = f"{domain}で潜在的なリスクを検知"
-            reason = "、".join(top_tokens) if top_tokens else "特定のキーワード"
-            content = (
-                f"通常と異なる閲覧傾向を検知しました。"
-                f"主な要因: {reason}。スコア={score:.3f}（閾値 {threshold:.3f} 以上）。"
-            )
-        else:  # en
-            title = f"Potential risk detected on {domain}"
-            reason = ", ".join(top_tokens) if top_tokens else "specific keywords"
-            content = (
-                f"Unusual browsing behavior detected. "
-                f"Key contributors: {reason}. Score={score:.3f} (>= threshold {threshold:.3f})."
-            )
-
+        row_url = str(row.get("url",""))   # ← 追加
+        content = build_human_friendly_content(
+            domain=domain,
+            title=str(row.get("title","")),
+            top_tokens=top_tokens,
+            ts_iso=str(row.get(TIMESTAMP_COL)) if TIMESTAMP_COL in df.columns else None,
+            locale=locale,
+            row_url=row_url
+        )
+        title_txt = f"{domain}で潜在的なリスクを検知" if row.get("is_anomaly",0)==1 else f"{domain}で新しい発見"
         results.append({
-            "title": title,
+            "title": title_txt,
             "content": content,
             "timing_at": date_str
         })
     return results
 
-# 使い方例（あなたのスクリプトの末尾付近）
+# ====== ここで“呼び出す” ======
 language_results = build_language_results(
-    df=df,
-    shap_values=shap_values,
-    sample_idx=sample_idx,    # さきほど説明対象に選んだ index リスト
-    threshold=thr,            # 異常しきい値
-    locale="ja"               # "en" なら英語で出力
+    df=df, shap_values=shap_values, sample_idx=sample_idx,
+    threshold=thr, locale="ja"
 )
-
-# JSONとして出力（印字 or 保存）
-print(json.dumps(language_results, ensure_ascii=False, indent=4))
+print(json.dumps(language_results, ensure_ascii=False, indent=2))
 with open("anomaly_language_results.json", "w", encoding="utf-8") as f:
     json.dump(language_results, f, ensure_ascii=False, indent=2)
