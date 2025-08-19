@@ -7,6 +7,8 @@ import pandas as pd
 import tldextract
 from tqdm import tqdm
 from datetime import datetime
+import json
+import re
 
 import torch
 import torch.nn as nn
@@ -256,3 +258,124 @@ plt.xlabel("score"); plt.ylabel("count")
 plt.tight_layout()
 plt.savefig("anomaly_score_hist.png")
 print("Saved plot: anomaly_score_hist.png")
+
+def _extract_top_tokens(sv, k=3):
+    """
+    SHAPのテキストExplanationから、正の寄与が大きい上位トークンを返す。
+    返り値: list[str]
+    """
+    import numpy as np
+    import re
+
+    # sv.data, sv.values は list/np.ndarray/ネスト配列のいずれか
+    tokens = sv.data
+    values = sv.values
+
+    # 何でも 1 次元の list に落とすユーティリティ
+    def _to_1d_list(x):
+        if isinstance(x, list):
+            # ネストしていれば 1 要素目を拾う（Text masker は [[...]] のことがある）
+            return x[0] if len(x) == 1 and isinstance(x[0], (list, np.ndarray)) else x
+        x = np.array(x, dtype=object)
+        if x.ndim == 0:
+            return [x.item()]
+        if x.ndim == 2 and x.shape[0] == 1:
+            x = x[0]
+        return list(x)
+
+    tokens = _to_1d_list(tokens)
+    values = _to_1d_list(values)
+
+    # 長さを合わせる（保険）
+    n = min(len(tokens), len(values))
+    tokens = tokens[:n]
+    values = values[:n]
+
+    pairs = []
+    for t, v in zip(tokens, values):
+        if t is None:
+            continue
+        tok = str(t).strip()
+        if not tok:
+            continue
+        # WordPieceの"##"を除去・特殊トークン除外
+        tok = re.sub(r"^##", "", tok)
+        if tok in {"[CLS]", "[SEP]", "[PAD]"}:
+            continue
+        pairs.append((tok, float(v)))
+
+    # 正の寄与のみ・寄与大きい順
+    pos = [(t, v) for t, v in pairs if v > 0]
+    pos.sort(key=lambda x: x[1], reverse=True)
+
+    # トークンの重複を軽く除去（上から）
+    seen = set()
+    top = []
+    for t, _ in pos:
+        if t not in seen:
+            top.append(t)
+            seen.add(t)
+        if len(top) >= k:
+            break
+    return top
+
+def _to_date_str(x):
+    try:
+        ts = pd.to_datetime(x, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
+    """
+    df: 異常スコア等を持つDataFrame（columns: title,url,visited_at, anomaly_score, is_anomaly）
+    shap_values: explain_textsに対応した shap.Explanation の配列
+    sample_idx: df上の行インデックス -> shap_values の順序に対応
+    threshold: 異常判定に使った閾値 (thr)
+    locale: "ja" | "en"
+    """
+    results = []
+    for pos, i in enumerate(sample_idx):
+        row = df.iloc[i]
+        top_tokens = _extract_top_tokens(shap_values[pos], k=3)
+        domain = extract_domain(row.get("url", ""))  # 既存関数を再利用
+        date_str = _to_date_str(row.get(TIMESTAMP_COL)) if TIMESTAMP_COL in df.columns else None
+        score = float(row.get("anomaly_score", 0.0))
+
+        if locale == "ja":
+            title = f"{domain}で潜在的なリスクを検知"
+            reason = "、".join(top_tokens) if top_tokens else "特定のキーワード"
+            content = (
+                f"通常と異なる閲覧傾向を検知しました。"
+                f"主な要因: {reason}。スコア={score:.3f}（閾値 {threshold:.3f} 以上）。"
+            )
+        else:  # en
+            title = f"Potential risk detected on {domain}"
+            reason = ", ".join(top_tokens) if top_tokens else "specific keywords"
+            content = (
+                f"Unusual browsing behavior detected. "
+                f"Key contributors: {reason}. Score={score:.3f} (>= threshold {threshold:.3f})."
+            )
+
+        results.append({
+            "title": title,
+            "content": content,
+            "timing_at": date_str
+        })
+    return results
+
+# 使い方例（あなたのスクリプトの末尾付近）
+language_results = build_language_results(
+    df=df,
+    shap_values=shap_values,
+    sample_idx=sample_idx,    # さきほど説明対象に選んだ index リスト
+    threshold=thr,            # 異常しきい値
+    locale="ja"               # "en" なら英語で出力
+)
+
+# JSONとして出力（印字 or 保存）
+print(json.dumps(language_results, ensure_ascii=False, indent=4))
+with open("anomaly_language_results.json", "w", encoding="utf-8") as f:
+    json.dump(language_results, f, ensure_ascii=False, indent=2)
