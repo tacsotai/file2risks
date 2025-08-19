@@ -22,7 +22,7 @@ import shap
 import matplotlib.pyplot as plt
 
 # ============== 設定 ==============
-CSV_PATH = "history.csv"  # あなたの履歴CSV
+CSV_PATH = "history.json"  # あなたの履歴CSV
 TEXT_COLS = ["title", "url"]  # どの列を埋め込みに使うか
 TIMESTAMP_COL = "visited_at"  # 任意
 MODEL_NAME = "bert-base-uncased"  # 純BERT（軽さ重視なら sentence-transformers も可）
@@ -39,9 +39,88 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
 # ============== データ前処理 ==============
-def load_history(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
-        # デモ用ダミーデータ
+def _chrome_time_to_iso(time_usec: Optional[object]) -> str:
+    """
+    Chrome Takeout の time_usec (Unix epoch microseconds, UTC) → ISO8601文字列(UTC)
+    例: 1752492402855767 -> "2025-08-13T01:26:42.855767Z"
+    """
+    try:
+        # int/str どちらも許容
+        t = int(time_usec)
+        # pandas はナノ秒ベースなので *1000 で ns にする
+        ts = pd.to_datetime(t * 1000, utc=True)  # microseconds -> nanoseconds
+        return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        return ""
+
+def _load_history_from_csv(path: str, text_cols: list, ts_col: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    for c in text_cols:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("")
+    if ts_col in df.columns:
+        df[ts_col] = df[ts_col].astype(str)
+    return df
+
+def _load_history_from_chrome_json(path: str, text_cols: list, ts_col: str) -> pd.DataFrame:
+    """
+    期待フォーマット:
+    {
+      "Browser History": [
+        {"title": "...", "url": "...", "time_usec": 1752492402855767, ...},
+        ...
+      ]
+    }
+    ※ 上位キーがない/配列直書きの変種にもゆるく対応
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # "Browser History" キー or 最初の配列を探す
+    if isinstance(data, dict):
+        if "Browser History" in data and isinstance(data["Browser History"], list):
+            items = data["Browser History"]
+        else:
+            # dict 内の最初の list を使う（安全側）
+            items = None
+            for v in data.values():
+                if isinstance(v, list):
+                    items = v; break
+            if items is None:
+                items = []
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title", "") or "")
+        url = str(it.get("url", "") or "")
+        # time_usec を visited_at(ISO) に
+        visited_at = _chrome_time_to_iso(it.get("time_usec"))
+        rows.append({"title": title, "url": url, ts_col: visited_at})
+
+    df = pd.DataFrame(rows)
+    # 欠損補完
+    for c in text_cols:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("")
+    if ts_col in df.columns:
+        df[ts_col] = df[ts_col].astype(str)
+    return df
+
+def load_history(input_path: str) -> pd.DataFrame:
+    """
+    拡張子で自動判定: .json -> Chrome Takeout / .csv -> CSV
+    ファイルがない場合はデモデータを返す（従来どおり）
+    """
+    if not os.path.exists(input_path):
+        # --- デモ用ダミーデータ（従来のまま） ---
         data = {
             "title": [
                 "How to use pandas merge",
@@ -49,8 +128,8 @@ def load_history(csv_path: str) -> pd.DataFrame:
                 "News: local weather today",
                 "Football highlights premier league",
                 "暗号通貨 市況 ニュース",
-                "Adult casino bonus offer",  # わざと怪しげ
-                "Free streaming movies now", # わざと怪しげ
+                "Adult casino bonus offer",
+                "Free streaming movies now",
             ],
             "url": [
                 "https://pandas.pydata.org/docs/user_guide/merging.html",
@@ -72,16 +151,22 @@ def load_history(csv_path: str) -> pd.DataFrame:
             ]
         }
         df = pd.DataFrame(data)
+        return df
+
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == ".json":
+        return _load_history_from_chrome_json(input_path, TEXT_COLS, TIMESTAMP_COL)
+    elif ext == ".csv":
+        return _load_history_from_csv(input_path, TEXT_COLS, TIMESTAMP_COL)
     else:
-        df = pd.read_csv(csv_path)
-    # 欠損対策
-    for c in TEXT_COLS:
-        if c not in df.columns:
-            df[c] = ""
-        df[c] = df[c].fillna("")
-    if TIMESTAMP_COL in df.columns:
-        df[TIMESTAMP_COL] = df[TIMESTAMP_COL].astype(str)
-    return df
+        # 拡張子不明ならJSONを試し、だめならCSV、最後にダミー
+        try:
+            return _load_history_from_chrome_json(input_path, TEXT_COLS, TIMESTAMP_COL)
+        except Exception:
+            try:
+                return _load_history_from_csv(input_path, TEXT_COLS, TIMESTAMP_COL)
+            except Exception:
+                return pd.DataFrame(columns=TEXT_COLS + [TIMESTAMP_COL])
 
 def extract_domain(url: str) -> str:
     try:
