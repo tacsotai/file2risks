@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 # save as: run_bert_from_takeout.py
 
-import argparse
-import io
-import json
-import os
 import re
 import shutil
-import sys
 import tempfile
 import zipfile
 from pathlib import Path
-import subprocess
 from typing import List, Optional
-from typing import Any
 import importlib.util
 
 HISTORY_NAME_PATTERNS = [
