@@ -79,9 +79,9 @@ def run_anomaly_detection(zip_path: str, bert_path: Optional[str] = None) -> Lis
 
         # bert モジュールの場所を決定
         if bert_path is None:
-            candidate = Path(__file__).resolve().parent / "samples/bert_ae_shap_browser_history.py"
+            candidate = Path(__file__).resolve().parent / "bert_ae_shap_browser_history.py"
             if not candidate.exists():
-                raise FileNotFoundError("bert_ae_shap_browser_history.py が見つかりません（samples/ 配下を確認してください）。")
+                raise FileNotFoundError("bert_ae_shap_browser_history.py が見つかりません。")
             bert_module_path = candidate
         else:
             bert_module_path = Path(bert_path).resolve()
