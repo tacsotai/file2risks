@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 import subprocess
 from typing import List, Optional
+from typing import Any
+import importlib.util
 
 HISTORY_NAME_PATTERNS = [
     r"history",          # EN
@@ -69,103 +71,57 @@ def extract_zip(zip_path: Path, to_dir: Path) -> None:
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(to_dir)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Google Takeout のブラウザ履歴 ZIP を展開し、history.json を作ってから "
-                    "bert_ae_shap_browser_history.py を実行します。"
-    )
-    parser.add_argument("zip_path", type=Path, help="Google Takeout の ZIP パス (例: xxx/yyy/zzz.zip)")
-    parser.add_argument("--bert", type=Path, default=None,
-                        help="bert_ae_shap_browser_history.py のパス（未指定なら同ディレクトリ検索）")
-    parser.add_argument("--workdir", type=Path, default=None,
-                        help="history.json を置いて実行する作業ディレクトリ（未指定なら一時ディレクトリ）")
-    parser.add_argument("--keep-workdir", action="store_true",
-                        help="終了後も作業ディレクトリを残す（デバッグ用）")
-    args = parser.parse_args()
-
-    # bert スクリプトの特定
-    if args.bert is None:
-        # このラッパースクリプトと同じディレクトリにある想定
-        candidate = Path(__file__).resolve().parent / "samples/bert_ae_shap_browser_history.py"
-        if not candidate.exists():
-            print("ERROR: --bert で bert_ae_shap_browser_history.py のパスを指定してください。", file=sys.stderr)
-            sys.exit(1)
-        bert_path = candidate
-    else:
-        bert_path = args.bert.resolve()
-        if not bert_path.exists():
-            print(f"ERROR: 指定の bert スクリプトが見つかりません: {bert_path}", file=sys.stderr)
-            sys.exit(1)
-
-    zip_path = args.zip_path.resolve()
-    if not zip_path.exists():
-        print(f"ERROR: ZIP が見つかりません: {zip_path}", file=sys.stderr)
-        sys.exit(1)
-
-    # 作業ディレクトリ
-    temp_dir = None
-    if args.workdir is None:
-        temp_dir = tempfile.TemporaryDirectory(prefix="takeout_extract_")
+def run_anomaly_detection(zip_path: str, bert_path: Optional[str] = None) -> List[dict]:
+    """
+    Google Takeout の ZIP を展開して history.json を用意し、
+    bert_ae_shap_browser_history.py の calc_risks(history.json) を直接呼び出して
+    List[dict] を返す。
+    - bert_path: bert_ae_shap_browser_history.py のファイルパス（未指定なら samples/ を自動探索）
+    """
+    temp_dir = tempfile.TemporaryDirectory(prefix="takeout_extract_")
+    try:
         workdir = Path(temp_dir.name)
-    else:
-        workdir = args.workdir.resolve()
-        workdir.mkdir(parents=True, exist_ok=True)
+        extract_dir = workdir / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
 
-    extract_dir = workdir / "extracted"
-    extract_dir.mkdir(parents=True, exist_ok=True)
+        # bert モジュールの場所を決定
+        if bert_path is None:
+            candidate = Path(__file__).resolve().parent / "samples/bert_ae_shap_browser_history.py"
+            if not candidate.exists():
+                raise FileNotFoundError("bert_ae_shap_browser_history.py が見つかりません（samples/ 配下を確認してください）。")
+            bert_module_path = candidate
+        else:
+            bert_module_path = Path(bert_path).resolve()
+            if not bert_module_path.exists():
+                raise FileNotFoundError(f"指定の bert モジュールが見つかりません: {bert_module_path}")
 
-    print(f"[1/4] Extracting: {zip_path} -> {extract_dir}")
-    try:
-        extract_zip(zip_path, extract_dir)
-    except zipfile.BadZipFile:
-        print("ERROR: ZIP が壊れている可能性があります。", file=sys.stderr)
-        if temp_dir: temp_dir.cleanup()
-        sys.exit(1)
+        # ZIP 展開
+        zp = Path(zip_path).resolve()
+        if not zp.exists():
+            raise FileNotFoundError(f"ZIP が見つかりません: {zp}")
+        extract_zip(zp, extract_dir)
 
-    print("[2/4] Searching for history JSON (言語差対応)")
-    hist_json = guess_history_json_file(extract_dir)
-    if not hist_json:
-        print("ERROR: 履歴 JSON が見つかりませんでした。ZIP 内容を確認してください。", file=sys.stderr)
-        if temp_dir and not args.keep_workdir:
-            temp_dir.cleanup()
-        sys.exit(1)
-
-    print(f"    -> candidate: {hist_json}")
-
-    # 出力 history.json を作成
-    target_history = workdir / "history.json"
-    print(f"[3/4] Writing normalized history.json -> {target_history}")
-    try:
-        # そのままコピー（bert スクリプトが 'history.json' を読む想定）
+        # history.json を特定して作業ディレクトリ直下に配置
+        hist_json = guess_history_json_file(extract_dir)
+        if not hist_json:
+            raise FileNotFoundError("履歴 JSON が見つかりません")
+        target_history = workdir / "history.json"
         shutil.copy2(hist_json, target_history)
-    except Exception as e:
-        print(f"ERROR: history.json の作成に失敗しました: {e}", file=sys.stderr)
-        if temp_dir and not args.keep_workdir:
-            temp_dir.cleanup()
-        sys.exit(1)
 
-    # bert スクリプト実行（カレントを workdir にして history.json を見つけやすくする）
-    print(f"[4/4] Running bert script: {bert_path.name} (cwd={workdir})")
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(bert_path)],
-            cwd=str(workdir),
-            check=False
-        )
-        code = proc.returncode
-    except FileNotFoundError:
-        print("ERROR: Python 実行に失敗しました。環境を確認してください。", file=sys.stderr)
-        code = 1
+        # 動的 import で calc_risks をロード
+        spec = importlib.util.spec_from_file_location("bert_ae_shap_browser_history", str(bert_module_path))
+        if spec is None or spec.loader is None:
+            raise ImportError("bert_ae_shap_browser_history のロードに失敗しました。")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
 
-    # 一時ディレクトリ掃除
-    if temp_dir and not args.keep_workdir:
+        if not hasattr(module, "calc_risks"):
+            raise AttributeError("bert_ae_shap_browser_history に calc_risks がありません。")
+
+        # 直接呼び出し
+        results: List[dict] = module.calc_risks(str(target_history))
+        return results
+
+    finally:
+        # 作業ディレクトリを後始末
         temp_dir.cleanup()
-
-    if code != 0:
-        print(f"bert スクリプトがエラー終了しました (exit={code})", file=sys.stderr)
-        sys.exit(code)
-
-    print("Done.")
-
-if __name__ == "__main__":
-    main()
