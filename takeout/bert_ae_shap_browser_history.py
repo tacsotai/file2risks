@@ -350,7 +350,7 @@ def build_human_friendly_content(domain: str, title: str, top_tokens: List[str],
             head = mapping.get(engine, f"{engine} で")
             return f"{head}「{q}」を検索しました。情報収集の一環です。"
         else:
-            return f"Searched {engine} for “{q}” as part of information gathering."
+            return f"Searched {engine} for “{q}” to gather context and evaluate sources."
 
     if locale == "ja":
         label = {
@@ -363,15 +363,32 @@ def build_human_friendly_content(domain: str, title: str, top_tokens: List[str],
         detail = f"（関連語: {', '.join(tokens)}）" if tokens else ""
         return f"{label}{detail}".strip()
     else:
-        label = {
-            "tech_docs": f"Visited {name} technical docs. Useful for implementation.",
-            "news": f"Checked news on {name}.",
-            "code_hosting": f"Reviewed repos/issues on {name}.",
-            "qna_forum": f"Looked up Q&A on {name}.",
-            "video_streaming": f"Watched content on {name}.",
-        }.get(cat, f"Visited {name}.")
-        detail = f" (key terms: {', '.join(tokens)})" if tokens else ""
-        return f"{label}{detail}".strip()
+        when = _hb_phrase_en(hb)
+        when_clause = f" {when.capitalize()}." if when else ""
+
+        base = {
+            "tech_docs": f"Exploring {name}'s technical documentation to unblock implementation and validate best practices.",
+            "news": f"Catching up on the latest coverage from {name} to stay on top of trends and potential impacts.",
+            "code_hosting": f"Reviewing repositories, issues, or pull requests on {name} as part of active development.",
+            "qna_forum": f"Searching {name} for explanations and proven fixes to troubleshoot a specific problem.",
+            "video_streaming": f"Watching a video on {name} for learning and research.",
+            "maps_travel": f"Checking routes and places on {name} to plan a visit or logistics.",
+            "finance_invest": f"Monitoring markets on {name} to gauge price action, news, and risk.",
+            "crypto": f"Scanning crypto-related updates on {name} to assess sentiment and security concerns.",
+            "gambling": f"Visited a gambling-related page on {name}; treat with caution.",
+            "adult": f"Visited adult content on {name}; flagged for caution.",
+            "shopping": f"Browsing products on {name} to compare options, specs, and prices.",
+            "collaboration": f"Using {name} to coordinate work and keep conversations moving.",
+            "productivity": f"Reviewing schedules and tasks on {name} to organize the day.",
+            "email_webmail": f"Reading or composing email on {name} to follow up and respond.",
+            "sports": f"Following sports updates on {name} for scores and storylines.",
+            "ai_ml": f"Researching AI/ML topics on {name} to inform experiments and designs.",
+        }.get(cat, f"Visiting {name} for general browsing.")
+
+        detail = _detail_sentence_en(tokens)
+        # 2文目以降に「時間帯」や「キーワード」を自然に配置
+        return f"{base}{when_clause}{detail}".strip()
+
 
 def _to_date_str(x):
     try:
@@ -406,6 +423,17 @@ def _extract_top_tokens(sv, k=3):
         if len(top) >= k: break
     return top
 
+def _hb_phrase_en(hb: str) -> str:
+    return {
+        "late_night": "late at night",
+        "early_morning": "early in the morning",
+        "daytime": "during the day",
+        "evening": "in the evening",
+    }.get(hb, "")
+
+def _detail_sentence_en(tokens: List[str]) -> str:
+    return f" Key terms: {', '.join(tokens)}." if tokens else ""
+
 def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
     results = []
     for pos, i in enumerate(sample_idx):
@@ -422,7 +450,10 @@ def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
             locale=locale,
             row_url=row_url
         )
-        title_txt = f"{domain}で潜在的なリスクを検知" if row.get("is_anomaly",0)==1 else f"{domain}で新しい発見"
+        if locale == "ja":
+            title_txt = f"{domain}で潜在的なリスクを検知" if row.get("is_anomaly",0)==1 else f"{domain}で新しい発見"
+        else:
+            title_txt = (f"Potential risk detected on {domain}" if row.get("is_anomaly", 0) == 1 else f"New finding on {domain}")
         results.append({"title": title_txt, "content": content, "timing_at": date_str})
     return results
 
