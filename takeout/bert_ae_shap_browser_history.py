@@ -17,7 +17,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 import shap
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 # ============== 設定 ==============
 TEXT_COLS = ["title", "url"]
@@ -478,8 +478,9 @@ def calc_risks(input_path: str) -> List[dict]:
     """
     履歴ファイル(JSON/CSV)を読み、BERT+AEで異常候補を推定し、
     SHAPで説明語を抽出、List[dict] を返す。
-    副次的に `anomaly_score_hist.png` と `shap_anomaly_texts.html` を生成します。
     """
+    # 副次的に `anomaly_score_hist.png` と `shap_anomaly_texts.html` を生成します。
+
     # 1) 読み込み & ロケール決定
     df = load_history(input_path)
     output_locale = decide_output_locale(df)
@@ -555,13 +556,13 @@ def calc_risks(input_path: str) -> List[dict]:
     shap_values = explainer(explain_texts)
 
     # 8) 可視化の保存（副次的）
-    html_path = "shap_anomaly_texts.html"
-    with open(html_path, "w", encoding="utf-8") as f:
-        for sv in shap_values:
-            f.write(shap.plots.text(sv, display=False))
-    plt.figure(); plt.hist(errors, bins=30); plt.axvline(thr, linestyle="--")
-    plt.title("Anomaly score distribution (MSE)"); plt.xlabel("score"); plt.ylabel("count")
-    plt.tight_layout(); plt.savefig("anomaly_score_hist.png")
+    # html_path = "shap_anomaly_texts.html"
+    # with open(html_path, "w", encoding="utf-8") as f:
+    #     for sv in shap_values:
+    #         f.write(shap.plots.text(sv, display=False))
+    # plt.figure(); plt.hist(errors, bins=30); plt.axvline(thr, linestyle="--")
+    # plt.title("Anomaly score distribution (MSE)"); plt.xlabel("score"); plt.ylabel("count")
+    # plt.tight_layout(); plt.savefig("anomaly_score_hist.png")
 
     # 9) 結果（List[dict]）
     results = build_language_results(
@@ -571,9 +572,6 @@ def calc_risks(input_path: str) -> List[dict]:
         threshold=thr,
         locale=output_locale
     )
-    # 便利用に保存（任意）
-    with open("anomaly_language_results.json","w",encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
     return results
 
 # ------------- CLI 互換 -------------
