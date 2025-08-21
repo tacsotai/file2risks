@@ -676,7 +676,7 @@ def calc_risks(input_path: str) -> List[dict]:
         threshold=thr,
         locale=output_locale
     )
-    return results
+    return {"results": results}
 
 # ------------- CLI 互換 -------------
 if __name__ == "__main__":

@@ -64,7 +64,7 @@ def extract_zip(zip_path: Path, to_dir: Path) -> None:
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(to_dir)
 
-def run_anomaly_detection(zip_path: str, bert_path: Optional[str] = None) -> List[dict]:
+def run_anomaly_detection(zip_path: str, bert_path: Optional[str] = None) -> dict:
     """
     Google Takeout の ZIP を展開して history.json を用意し、
     bert_ae_shap_browser_history.py の calc_risks(history.json) を直接呼び出して
@@ -112,8 +112,7 @@ def run_anomaly_detection(zip_path: str, bert_path: Optional[str] = None) -> Lis
             raise AttributeError("bert_ae_shap_browser_history に calc_risks がありません。")
 
         # 直接呼び出し
-        results: List[dict] = module.calc_risks(str(target_history))
-        return results
+        return module.calc_risks(str(target_history))
 
     finally:
         # 作業ディレクトリを後始末

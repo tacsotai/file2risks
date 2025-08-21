@@ -8,4 +8,4 @@ if __name__ == "__main__":
 
     file_path = sys.argv[1]
     results = run_anomaly_detection(file_path)
-    print("Results:", results)
+    print(results)
