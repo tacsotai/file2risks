@@ -571,8 +571,15 @@ def calc_risks(input_path: str) -> List[dict]:
     df["anomaly_score"] = errors; df["is_anomaly"] = labels
 
     # 7) SHAP（テキスト説明）
-    sample_idx = df["anomaly_score"].nlargest(min(5, len(df))).index.tolist()
-    explain_texts = [texts[i] for i in sample_idx]
+    # 5件ではなく一番確率が高い1件
+    # sample_idx = df["anomaly_score"].nlargest(min(5, len(df))).index.tolist()
+    if (df["is_anomaly"] == 1).any():
+        top_idx = df.loc[df["is_anomaly"] == 1, "anomaly_score"].idxmax()
+    else:
+        top_idx = df["anomaly_score"].idxmax()
+    sample_idx = [top_idx]  # ← 1件だけ
+    # explain_texts = [texts[i] for i in sample_idx]
+    explain_texts = [texts[top_idx]] # ← 1件だけ
 
     masker = shap.maskers.Text(tokenizer)
 
