@@ -397,6 +397,56 @@ def _to_date_str(x):
         return ts.strftime("%Y-%m-%d")
     except Exception:
         return None
+    
+def _top_token_contribs(sv, k=3, normalize=True, round_ndigits=3):
+    """
+    Text SHAP Explanation から上位 k トークンの寄与度を {token: weight} で返す。
+    正の寄与のみを採用。normalize=True なら合計が 1 になるように正規化。
+    """
+    tokens = sv.data
+    values = sv.values
+
+    def _to_1d_list(x):
+        if isinstance(x, list):
+            if len(x) == 1 and isinstance(x[0], (list, np.ndarray)):
+                return x[0]
+            return x
+        x = np.array(x, dtype=object)
+        if x.ndim == 0:
+            return [x.item()]
+        if x.ndim == 2 and x.shape[0] == 1:
+            x = x[0]
+        return list(x)
+
+    toks = _to_1d_list(tokens)
+    vals = _to_1d_list(values)
+
+    pairs = []
+    for t, v in zip(toks, vals):
+        if t is None:
+            continue
+        tok = re.sub(r"^##", "", str(t).strip())
+        if not tok or tok in {"[CLS]","[SEP]","[PAD]"}:
+            continue
+        if re.fullmatch(r"\d{1,4}", tok):  # 数字だけは除外（不要なら消してください）
+            continue
+        v = float(v)
+        if v > 0:
+            pairs.append((tok, v))
+
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    pairs = pairs[:k]
+
+    if not pairs:
+        return {}
+
+    if normalize:
+        s = sum(v for _, v in pairs)
+        if s > 0:
+            pairs = [(t, v / s) for t, v in pairs]
+
+    return {t: round(v, round_ndigits) for t, v in pairs}
+
 
 def _extract_top_tokens(sv, k=3):
     tokens = sv.data; values = sv.values
@@ -438,10 +488,19 @@ def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
     results = []
     for pos, i in enumerate(sample_idx):
         row = df.iloc[i]
-        top_tokens = _extract_top_tokens(shap_values[pos], k=3)
+        sv = shap_values[pos]
+
+        # 追加: トップ寄与トークン -> {token: weight}
+        reason_map = _top_token_contribs(sv, k=3, normalize=True)
+        top_tokens = list(reason_map.keys())
+        if not top_tokens:
+            # フォールバック（既存の簡易版）
+            top_tokens = _extract_top_tokens(sv, k=3)
+
         domain = extract_domain(row.get("url",""))
         date_str = _to_date_str(row.get(TIMESTAMP_COL)) if TIMESTAMP_COL in df.columns else None
         row_url = str(row.get("url",""))
+
         content = build_human_friendly_content(
             domain=domain,
             title=str(row.get("title","")),
@@ -454,7 +513,14 @@ def build_language_results(df, shap_values, sample_idx, threshold, locale="ja"):
             title_txt = f"{domain}で潜在的なリスクを検知" if row.get("is_anomaly",0)==1 else f"{domain}で新しい発見"
         else:
             title_txt = (f"Potential risk detected on {domain}" if row.get("is_anomaly", 0) == 1 else f"New finding on {domain}")
-        results.append({"title": title_txt, "content": content, "timing_at": date_str})
+
+        # ← ここで reason を追加
+        results.append({
+            "reason": reason_map,
+            "title": title_txt,
+            "content": content,
+            "timing_at": date_str
+        })
     return results
 
 # ------------- 埋め込み/モデル -------------
