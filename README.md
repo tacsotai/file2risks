@@ -85,4 +85,16 @@ python main.py ~/Downloads/takeout-yyyyMM..XXX.zip
 
 ## 8. Community
 - Coming soon: Discord/Slack for discussions  
-- For now: please use GitHub **Issues** & **Discussions**  
+- For now: please use GitHub **Issues** & **Discussions**
+---
+
+## 9. Donation
+
+If you find **file2risks** useful and would like to support its development,  
+you can donate Bitcoin to the following address:
+
+**Bitcoin Address (BTC):**
+
+```
+3LvyGJFgzP5ox3X4sLYun4ojz3xuYYcPbk
+```
